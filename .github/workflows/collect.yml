@@ -160,6 +160,17 @@ jobs:
           python src/outcomes.py data
           python src/events.py data
           python -m unittest discover -s tests -v
+        - name: Notify Discord
+        if: ${{ secrets.DISCORD_WEBHOOK_URL != '' }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          from src.discord_notify import send_report
+          with open("data/advisor_report.md", encoding="utf-8") as f:
+              send_report(f.read())
+          PY
 
       - name: Save diagnostic HTML
         if: always()
