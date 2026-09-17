@@ -1,4 +1,4 @@
-name: FC27 market engine
+name: FC27 market engine v3
 
 on:
   workflow_dispatch:
@@ -15,607 +15,282 @@ concurrency:
 jobs:
   market-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
 
-      # ============================================================
-      # 1. COLECTOR
-      # ============================================================
-
-      - name: Collect FUT.GG prices
+      - name: Collect dynamic FUT.GG universe
         run: |
           python - <<'PY'
-          import csv
-          import html as htmlmod
-          import json
-          import re
-          import urllib.request
-
+          import csv, hashlib, html as htmlmod, json, re, urllib.request, uuid
           from datetime import datetime, timezone
           from pathlib import Path
 
           URL = "https://www.fut.gg/cheapest-by-rating/"
-
-          TARGETS = {
-              "Bellingham": r"Bellingham",
-              "Haaland": r"Haaland",
-              "Rodri": r"Rodri",
-              "Kane": r"Kane",
-              "Vitinha": r"Vitinha",
-              "Pedri": r"Pedri",
-              "Olise": r"Olise",
-              "Aitana": r"Aitana(?:\s+Bonmat[ií])?",
-              "Yamal": r"(?:Lamine\s+)?Yamal",
-              "Mbappe": r"Mbapp[eé]",
-          }
-
-          POSITIONS = (
-              "GK|RB|RWB|CB|LB|LWB|"
-              "CDM|CM|CAM|RM|RW|LM|LW|"
-              "CF|ST"
-          )
+          OUT = Path("data/market_prices.csv")
+          SNAPSHOTS = Path("data/snapshots.csv")
+          DEBUG = Path("debug/page.html")
 
           req = urllib.request.Request(
               URL,
               headers={
-                  "User-Agent":
-                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 Chrome/140 Safari/537.36",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
                   "Accept-Language": "en-US,en;q=0.9",
               },
           )
-
-          with urllib.request.urlopen(
-              req,
-              timeout=30
-          ) as response:
-
-              raw = response.read().decode(
-                  "utf-8",
-                  "replace"
-              )
-
+          with urllib.request.urlopen(req, timeout=30) as response:
+              raw_bytes = response.read()
               status = response.status
 
-          print("HTTP:", status)
-          print("Bytes:", len(raw))
+          if status != 200 or len(raw_bytes) < 10000:
+              raise SystemExit(f"Respuesta FUT.GG inválida: HTTP={status}, bytes={len(raw_bytes)}")
 
-          if status != 200:
-              raise SystemExit(
-                  f"HTTP inesperado: {status}"
-              )
+          raw = raw_bytes.decode("utf-8", "replace")
+          page_sha = hashlib.sha256(raw_bytes).hexdigest()
+          timestamp = datetime.now(timezone.utc).isoformat()
+          snapshot_id = uuid.uuid4().hex[:16]
 
-          if len(raw) < 10000:
-              raise SystemExit(
-                  "HTML sospechosamente pequeño"
-              )
+          DEBUG.parent.mkdir(exist_ok=True)
+          DEBUG.write_text(raw, encoding="utf-8")
 
-          Path("debug").mkdir(exist_ok=True)
-
-          Path(
-              "debug/page.html"
-          ).write_text(
-              raw,
-              encoding="utf-8"
+          # Cada tarjeta de cheapest-by-rating contiene una URL estable /27-ID/,
+          # nombre, precio, posición y GRL. El ID evita confundir versiones.
+          card_re = re.compile(
+              r'href="/players/(?P<base>\d+)-[^"]+/27-(?P<item>\d+)/"[^>]*>'
+              r'.*?<img[^>]+alt="(?P<name>[^"]+)"[^>]*>'
+              r'.*?<img src="/public-assets/coin\.webp"[^>]*/>(?P<price>[\d,]+)'
+              r'.*?<div class="rounded h-\[30px\] w-\[30px\][^"]*">(?P<position>[A-Z]+)</div>'
+              r'<div class="rounded h-\[30px\] w-\[30px\][^"]*">(?P<rating>\d{2})</div>',
+              re.S,
           )
 
-          text = re.sub(
-              r"<script\b[^>]*>.*?</script>",
-              " ",
-              raw,
-              flags=re.I | re.S,
-          )
-
-          text = re.sub(
-              r"<style\b[^>]*>.*?</style>",
-              " ",
-              text,
-              flags=re.I | re.S,
-          )
-
-          text = re.sub(
-              r"<[^>]+>",
-              " ",
-              text
-          )
-
-          text = htmlmod.unescape(text)
-
-          text = re.sub(
-              r"\s+",
-              " ",
-              text
-          ).strip()
-
-          results = {}
-
-          for key, player_pattern in TARGETS.items():
-
-              pattern = re.compile(
-                  rf"\b(?P<name>{player_pattern})\b"
-                  rf"\s+"
-                  rf"(?P<price>\d{{1,3}}(?:,\d{{3}})+)"
-                  rf"\s+"
-                  rf"(?P<position>{POSITIONS})"
-                  rf"\s+"
-                  rf"(?P<rating>\d{{2}})"
-                  rf"\b",
-                  re.I,
-              )
-
-              matches = list(
-                  pattern.finditer(text)
-              )
-
-              if not matches:
-                  print(
-                      f"NO MATCH: {key}"
-                  )
+          cards = {}
+          for m in card_re.finditer(raw):
+              card_id = f"27-{m.group('item')}"
+              price = int(m.group("price").replace(",", ""))
+              rating = int(m.group("rating"))
+              if not 150 <= price <= 20_000_000 or not 70 <= rating <= 99:
                   continue
-
-              match = matches[0]
-
-              price = int(
-                  match.group(
-                      "price"
-                  ).replace(",", "")
-              )
-
-              rating = int(
-                  match.group("rating")
-              )
-
-              position = (
-                  match.group(
-                      "position"
-                  ).upper()
-              )
-
-              if not (
-                  500
-                  <= price
-                  <= 20_000_000
-              ):
-                  continue
-
-              if not (
-                  75
-                  <= rating
-                  <= 99
-              ):
-                  continue
-
-              results[key] = {
-                  "price": price,
+              cards[card_id] = {
+                  "card_id": card_id,
+                  "base_id": m.group("base"),
+                  "name": htmlmod.unescape(m.group("name")).strip(),
                   "rating": rating,
-                  "position": position,
+                  "position": m.group("position"),
+                  "price": price,
               }
 
-          print(
-              json.dumps(
-                  results,
-                  indent=2,
-                  ensure_ascii=False,
-              )
-          )
+          print(f"HTTP {status} | bytes={len(raw_bytes)} | sha256={page_sha}")
+          print(f"Snapshot {snapshot_id} | cartas únicas={len(cards)}")
+          print("Ratings:", sorted({c["rating"] for c in cards.values()}))
 
-          print(
-              "REGISTROS VALIDOS:",
-              len(results),
-              "/",
-              len(TARGETS),
-          )
+          # El artefacto inspeccionado previamente daba 122 cartas.
+          # Permitimos cambios naturales en la página, pero fallamos si el parser se rompe.
+          if len(cards) < 80:
+              raise SystemExit(f"Parser sospechoso: solo {len(cards)} cartas")
 
-          if len(results) < 8:
-              raise SystemExit(
-                  "Parser validation failed"
-              )
-
-          timestamp = datetime.now(
-              timezone.utc
-          ).isoformat()
-
-          output = Path(
-              "data/prices.csv"
-          )
-
-          output.parent.mkdir(
-              exist_ok=True
-          )
-
-          new_file = not output.exists()
-
-          with output.open(
-              "a",
-              newline="",
-              encoding="utf-8",
-          ) as f:
-
-              writer = csv.writer(f)
-
-              if new_file:
-                  writer.writerow([
-                      "timestamp_utc",
-                      "player",
-                      "rating",
-                      "position",
-                      "price",
-                      "source",
+          OUT.parent.mkdir(exist_ok=True)
+          new = not OUT.exists()
+          with OUT.open("a", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              if new:
+                  w.writerow([
+                      "timestamp_utc","snapshot_id","page_sha256","card_id","base_id",
+                      "name","rating","position","price","source"
+                  ])
+              for c in sorted(cards.values(), key=lambda x: (x["rating"], x["price"], x["card_id"])):
+                  w.writerow([
+                      timestamp,snapshot_id,page_sha,c["card_id"],c["base_id"],c["name"],
+                      c["rating"],c["position"],c["price"],URL
                   ])
 
-              for player, data in results.items():
+          snap_new = not SNAPSHOTS.exists()
+          with SNAPSHOTS.open("a", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              if snap_new:
+                  w.writerow(["timestamp_utc","snapshot_id","page_sha256","cards","min_rating","max_rating","source"])
+              ratings = [c["rating"] for c in cards.values()]
+              w.writerow([timestamp,snapshot_id,page_sha,len(cards),min(ratings),max(ratings),URL])
 
-                  writer.writerow([
-                      timestamp,
-                      player,
-                      data["rating"],
-                      data["position"],
-                      data["price"],
-                      URL,
-                  ])
-
-          print(
-              "Snapshot guardado:",
-              timestamp
-          )
+          print(json.dumps(list(cards.values())[:10], ensure_ascii=False, indent=2))
           PY
 
-      # ============================================================
-      # 2. ANALIZADOR DE MERCADO
-      # ============================================================
-
-      - name: Build market analysis
+      - name: Analyze market quality and signals
         run: |
           python - <<'PY'
-          import csv
-          import math
-
+          import csv, math, statistics
           from collections import defaultdict
           from datetime import datetime
           from pathlib import Path
 
-          PRICE_FILE = Path(
-              "data/prices.csv"
-          )
-
-          REPORT_FILE = Path(
-              "data/market_report.md"
-          )
-
-          EA_TAX = 0.05
+          IN = Path("data/market_prices.csv")
+          REPORT = Path("data/market_report.md")
+          SIGNALS = Path("data/signals.csv")
+          TAX = 0.05
 
           rows = []
-
-          with PRICE_FILE.open(
-              encoding="utf-8"
-          ) as f:
-
-              for row in csv.DictReader(f):
-
-                  row["price"] = int(
-                      row["price"]
-                  )
-
-                  row["rating"] = int(
-                      row["rating"]
-                  )
-
-                  row["timestamp"] = (
-                      datetime.fromisoformat(
-                          row["timestamp_utc"]
-                      )
-                  )
-
-                  rows.append(row)
+          with IN.open(encoding="utf-8") as f:
+              for r in csv.DictReader(f):
+                  r["price"] = int(r["price"])
+                  r["rating"] = int(r["rating"])
+                  r["ts"] = datetime.fromisoformat(r["timestamp_utc"])
+                  rows.append(r)
 
           if not rows:
-              raise SystemExit(
-                  "No hay precios"
-              )
+              raise SystemExit("Sin datos")
 
-          by_player = defaultdict(list)
+          by_card = defaultdict(list)
+          by_snapshot = defaultdict(list)
+          for r in rows:
+              by_card[r["card_id"]].append(r)
+              by_snapshot[r["snapshot_id"]].append(r)
+          for h in by_card.values():
+              h.sort(key=lambda r: r["ts"])
 
-          for row in rows:
-              by_player[
-                  row["player"]
-              ].append(row)
+          latest_snapshot = max(by_snapshot.values(), key=lambda rs: rs[0]["ts"])
+          latest_id = latest_snapshot[0]["snapshot_id"]
+          latest_ts = latest_snapshot[0]["ts"]
 
-          def pct(old, new):
-
-              if not old:
-                  return None
-
-              return (
-                  new / old - 1
-              ) * 100
-
-          def fmt_pct(value):
-
-              if value is None:
-                  return "—"
-
-              return (
-                  f"{value:+.2f}%"
-              )
+          # Índices de mercado por GRL: mediana del precio de las cartas presentes.
+          rating_index = {}
+          for rating in sorted({r["rating"] for r in latest_snapshot}):
+              ps = [r["price"] for r in latest_snapshot if r["rating"] == rating]
+              rating_index[rating] = statistics.median(ps)
 
           summaries = []
+          emitted = []
 
-          for player, history in (
-              by_player.items()
-          ):
+          for latest in latest_snapshot:
+              h = by_card[latest["card_id"]]
+              prices = [x["price"] for x in h]
+              n = len(h)
+              med = statistics.median(prices)
+              recent = prices[-6:]
+              recent_med = statistics.median(recent)
 
-              history.sort(
-                  key=lambda x:
-                  x["timestamp"]
-              )
-
-              first = history[0]
-              latest = history[-1]
-
-              prices = [
-                  x["price"]
-                  for x in history
+              # Cambios logarítmicos son más estables para saltos grandes.
+              log_returns = [
+                  math.log(b / a)
+                  for a, b in zip(prices, prices[1:])
+                  if a > 0 and b > 0
               ]
+              vol = statistics.pstdev(log_returns) if len(log_returns) >= 2 else None
 
-              change = pct(
-                  first["price"],
-                  latest["price"]
-              )
+              # Persistencia: proporción de las últimas observaciones que permanecen
+              # dentro de ±15% de la mediana reciente. En mercados finos no marcamos
+              # saltos como error; reducimos confianza si no persisten.
+              if len(recent) >= 2:
+                  persistence = sum(abs(p / recent_med - 1) <= 0.15 for p in recent) / len(recent)
+              else:
+                  persistence = 0.0
 
-              break_even = math.ceil(
-                  latest["price"]
-                  /
-                  (1 - EA_TAX)
-              )
+              # Confianza 0..100. Premia histórico y persistencia; penaliza volatilidad,
+              # pero nunca invalida automáticamente un precio por ser extremo.
+              history_score = min(n / 12, 1.0)
+              vol_penalty = min((vol or 0.0) / 0.35, 1.0)
+              confidence = round(100 * (0.55 * history_score + 0.45 * persistence) * (1 - 0.35 * vol_penalty))
+
+              delta_med = (latest["price"] / recent_med - 1) * 100 if recent_med else 0
+              break_even = math.ceil(latest["price"] / (1 - TAX))
+
+              # Señal experimental SOLO con >=12 observaciones (~48h a 4h).
+              # No confunde "caída grande" con error: exige persistencia/confianza
+              # y margen suficiente para cubrir impuesto + colchón.
+              signal = "WAIT"
+              reason = "histórico insuficiente"
+              if n >= 12:
+                  if confidence >= 60 and delta_med <= -10:
+                      target = round(recent_med)
+                      net_roi = ((target * (1 - TAX)) / latest["price"] - 1) * 100
+                      if net_roi >= 8:
+                          signal = "WATCH_BUY"
+                          reason = f"precio {abs(delta_med):.1f}% bajo mediana reciente; ROI neto teórico {net_roi:.1f}%"
+                      else:
+                          reason = "descuento insuficiente tras impuesto"
+                  else:
+                      reason = "sin descuento confirmado o confianza insuficiente"
 
               summaries.append({
-                  "player": player,
-                  "rating":
-                      latest["rating"],
-                  "position":
-                      latest["position"],
-                  "price":
-                      latest["price"],
-                  "observations":
-                      len(history),
-                  "change":
-                      change,
-                  "min":
-                      min(prices),
-                  "max":
-                      max(prices),
-                  "break_even":
-                      break_even,
+                  "name": latest["name"], "card_id": latest["card_id"], "rating": latest["rating"],
+                  "pos": latest["position"], "price": latest["price"], "n": n,
+                  "median": round(med), "recent_median": round(recent_med),
+                  "delta": delta_med, "vol": vol, "persistence": persistence,
+                  "confidence": confidence, "break_even": break_even, "signal": signal, "reason": reason,
               })
+              if signal != "WAIT":
+                  emitted.append((latest, confidence, delta_med, reason))
 
-          summaries.sort(
-              key=lambda x:
-              x["price"]
-          )
-
-          latest_timestamp = max(
-              x["timestamp"]
-              for x in rows
-          )
+          # Orden: primero señales, luego menor confianza para que el informe revele
+          # dónde el mercado es más fino/inestable.
+          summaries.sort(key=lambda x: (x["signal"] != "WATCH_BUY", -x["confidence"], x["rating"], x["price"]))
 
           lines = [
-              "# FC27 Market Report",
+              "# FC27 Market Report v3", "",
+              f"Snapshot: **{latest_ts.isoformat()}** · ID `{latest_id}`",
+              f"Cartas en snapshot: **{len(latest_snapshot)}** · Cartas históricas: **{len(by_card)}**",
               "",
-              (
-                  "Último snapshot UTC: "
-                  f"**{latest_timestamp.isoformat()}**"
-              ),
+              "> Los movimientos extremos no se descartan: en un mercado con poca oferta pueden ser reales. "
+              "La confianza mide persistencia, historial y volatilidad; no sustituye la liquidez real.",
               "",
-              (
-                  "Observaciones totales: "
-                  f"**{len(rows)}**"
-              ),
-              "",
-              (
-                  "> Break-even calculado "
-                  "incluyendo el 5% "
-                  "de impuesto de EA."
-              ),
-              "",
-              (
-                  "| Jugador | GRL | Pos | "
-                  "Precio | Obs | Cambio | "
-                  "Mín | Máx | Break-even |"
-              ),
-              (
-                  "|---|---:|---|---:|---:|"
-                  "---:|---:|---:|---:|"
-              ),
+              "## Índice por GRL", "",
+              "| GRL | Mediana actual |", "|---:|---:|",
           ]
+          for rating, idx in rating_index.items():
+              lines.append(f"| {rating} | {idx:,.0f} |")
 
-          for item in summaries:
-
+          lines += ["", "## Cartas actuales", "",
+                    "| Carta | ID | GRL | Pos | Precio | Obs | Mediana reciente | Δ mediana | Persist. | Conf. | Break-even | Estado |",
+                    "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|"]
+          for s in summaries:
               lines.append(
-                  f"| {item['player']} "
-                  f"| {item['rating']} "
-                  f"| {item['position']} "
-                  f"| {item['price']:,} "
-                  f"| {item['observations']} "
-                  f"| {fmt_pct(item['change'])} "
-                  f"| {item['min']:,} "
-                  f"| {item['max']:,} "
-                  f"| {item['break_even']:,} |"
+                  f"| {s['name']} | `{s['card_id']}` | {s['rating']} | {s['pos']} | {s['price']:,} | "
+                  f"{s['n']} | {s['recent_median']:,} | {s['delta']:+.1f}% | "
+                  f"{s['persistence']:.0%} | {s['confidence']} | {s['break_even']:,} | {s['signal']} |"
               )
 
-          lines += [
-              "",
-              "## Señales preliminares",
-              "",
-          ]
-
-          # Aún no emitimos señales reales
-          # hasta disponer de histórico suficiente.
-
-          enough_history = all(
-              item["observations"] >= 6
-              for item in summaries
-          )
-
-          if not enough_history:
-
-              lines.append(
-                  "⏳ Acumulando histórico. "
-                  "Se requieren al menos "
-                  "6 observaciones por jugador "
-                  "antes de activar señales."
-              )
-
+          lines += ["", "## Motor de señales", ""]
+          if not emitted:
+              lines.append("Sin señales activas. El motor exige al menos 12 observaciones por carta y margen neto después del 5% de EA.")
           else:
+              for r, conf, delta, reason in emitted:
+                  lines.append(f"- **{r['name']} ({r['card_id']})** — confianza {conf}/100: {reason}.")
 
-              movers = sorted(
-                  summaries,
-                  key=lambda x:
-                  x["change"],
-              )
+          REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-              lines.append(
-                  "### Mayores caídas"
-              )
+          # Registro append-only de señales para backtesting futuro.
+          sig_new = not SIGNALS.exists()
+          with SIGNALS.open("a", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              if sig_new:
+                  w.writerow(["timestamp_utc","snapshot_id","card_id","name","price","signal","confidence","delta_recent_median_pct","reason"])
+              for r, conf, delta, reason in emitted:
+                  w.writerow([r["timestamp_utc"],r["snapshot_id"],r["card_id"],r["name"],r["price"],
+                              "WATCH_BUY",conf,f"{delta:.4f}",reason])
 
-              for item in movers[:5]:
-
-                  lines.append(
-                      f"- {item['player']}: "
-                      f"{fmt_pct(item['change'])}"
-                  )
-
-              lines.append("")
-              lines.append(
-                  "### Mayores subidas"
-              )
-
-              for item in reversed(
-                  movers[-5:]
-              ):
-
-                  lines.append(
-                      f"- {item['player']}: "
-                      f"{fmt_pct(item['change'])}"
-                  )
-
-          REPORT_FILE.write_text(
-              "\n".join(lines) + "\n",
-              encoding="utf-8",
-          )
-
-          print(
-              REPORT_FILE.read_text(
-                  encoding="utf-8"
-              )
-          )
+          print(REPORT.read_text(encoding="utf-8"))
           PY
 
-      # ============================================================
-      # 3. VALIDACIÓN DEL HISTÓRICO
-      # ============================================================
-
-      - name: Validate database
+      - name: Validate dataset
         run: |
           python - <<'PY'
           import csv
-
           from collections import Counter
           from pathlib import Path
 
-          path = Path(
-              "data/prices.csv"
-          )
-
-          rows = list(
-              csv.DictReader(
-                  path.open(
-                      encoding="utf-8"
-                  )
-              )
-          )
-
+          rows = list(csv.DictReader(Path("data/market_prices.csv").open(encoding="utf-8")))
+          snaps = Counter(r["snapshot_id"] for r in rows)
           if not rows:
-              raise SystemExit(
-                  "CSV vacío"
-              )
-
-          required = {
-              "timestamp_utc",
-              "player",
-              "rating",
-              "position",
-              "price",
-              "source",
-          }
-
-          if set(
-              rows[0].keys()
-          ) != required:
-
-              raise SystemExit(
-                  "Schema incorrecto"
-              )
-
-          for row in rows:
-
-              price = int(
-                  row["price"]
-              )
-
-              rating = int(
-                  row["rating"]
-              )
-
-              if not (
-                  500
-                  <= price
-                  <= 20_000_000
-              ):
-                  raise SystemExit(
-                      "Precio inválido: "
-                      + str(row)
-                  )
-
-              if not (
-                  75
-                  <= rating
-                  <= 99
-              ):
-                  raise SystemExit(
-                      "Rating inválido: "
-                      + str(row)
-                  )
-
-          counts = Counter(
-              row["player"]
-              for row in rows
-          )
-
-          print(
-              "Filas:",
-              len(rows)
-          )
-
-          print(
-              "Jugadores:",
-              len(counts)
-          )
-
-          print(
-              "Observaciones:",
-              dict(counts)
-          )
-
-          print(
-              "DATABASE VALIDATION OK"
-          )
+              raise SystemExit("Dataset vacío")
+          if min(snaps.values()) < 80:
+              raise SystemExit(f"Snapshot incompleto detectado: {snaps}")
+          if len({(r["snapshot_id"], r["card_id"]) for r in rows}) != len(rows):
+              raise SystemExit("Duplicados snapshot/card_id")
+          print("DATASET OK")
+          print("Snapshots:", len(snaps))
+          print("Filas:", len(rows))
+          print("Último snapshot:", list(snaps.items())[-1])
           PY
-
-      # ============================================================
-      # 4. ARTIFACT DE DIAGNÓSTICO
-      # ============================================================
 
       - name: Save diagnostic HTML
         if: always()
@@ -625,38 +300,14 @@ jobs:
           path: debug/page.html
           retention-days: 1
 
-      # ============================================================
-      # 5. GUARDAR HISTÓRICO + INFORME
-      # ============================================================
-
-      - name: Commit market data
+      - name: Commit market database
         run: |
-          git config \
-            user.name \
-            "fc27-market-bot"
-
-          git config \
-            user.email \
-            "actions@users.noreply.github.com"
-
-          git add \
-            data/prices.csv \
-            data/market_report.md
-
-          if git diff \
-            --cached \
-            --quiet
-          then
-
-            echo \
-              "No changes to commit"
-
+          git config user.name "fc27-market-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/market_prices.csv data/snapshots.csv data/market_report.md data/signals.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
           else
-
-            git commit \
-              -m \
-              "data: FC27 market update $(date -u +'%Y-%m-%dT%H:%MZ')"
-
+            git commit -m "data: FC27 market v3 $(date -u +'%Y-%m-%dT%H:%MZ')"
             git push
-
           fi
