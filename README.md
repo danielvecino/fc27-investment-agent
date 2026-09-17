@@ -7,7 +7,8 @@ Liquidez y segmentos son aproximaciones; cheapest-by-rating es una muestra sesga
 no un registro de ventas ni de profundidad. El objetivo basado en mediana no es una predicción.
 Los outcomes muestran rentabilidad hipotética después del 5% de EA, no operaciones ejecutadas.
 Las fechas de régimen son configuración heredada del proyecto. Eventos y rumores requieren
-registro con fuente; todavía no hay ingesta automática de noticias ni histórico FC25/26.
+registro con fuente; el histórico FC25/26 sólo se importa si contiene precios fechados,
+card_id, plataforma y URL de origen verificables.
 
 El workflow contiene una copia de los módulos para desplegarlos con la sesión web;
 al modificar el código, hay que actualizar también esa copia o se restaurará en la siguiente ejecución.
