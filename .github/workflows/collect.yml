@@ -33,18 +33,24 @@ jobs:
 
           URL = "https://www.fut.gg/cheapest-by-rating/"
 
-          TARGETS = [
-              "Bellingham",
-              "Haaland",
-              "Rodri",
-              "Kane",
-              "Vitinha",
-              "Pedri",
-              "Olise",
-              "Aitana",
-              "Yamal",
-              "Mbapp",
-          ]
+          TARGETS = {
+              "Bellingham": r"Bellingham",
+              "Haaland": r"Haaland",
+              "Rodri": r"Rodri",
+              "Kane": r"Kane",
+              "Vitinha": r"Vitinha",
+              "Pedri": r"Pedri",
+              "Olise": r"Olise",
+              "Aitana": r"Aitana(?:\s+Bonmat[ií])?",
+              "Yamal": r"(?:Lamine\s+)?Yamal",
+              "Mbappe": r"Mbapp[eé]",
+          }
+
+          POSITIONS = (
+              "GK|RB|RWB|CB|LB|LWB|"
+              "CDM|CM|CAM|RM|RW|LM|LW|"
+              "CF|ST"
+          )
 
           req = urllib.request.Request(
               URL,
@@ -56,14 +62,28 @@ jobs:
               },
           )
 
-          with urllib.request.urlopen(req, timeout=30) as r:
-              raw = r.read().decode("utf-8", "replace")
-              print("HTTP:", r.status)
-              print("Bytes:", len(raw))
+          with urllib.request.urlopen(req, timeout=30) as response:
+              raw = response.read().decode("utf-8", "replace")
+              status = response.status
 
+          print("HTTP:", status)
+          print("Bytes:", len(raw))
+
+          if status != 200:
+              raise SystemExit(f"HTTP inesperado: {status}")
+
+          if len(raw) < 10000:
+              raise SystemExit("Respuesta HTML sospechosamente pequeña")
+
+          # HTML solo para diagnóstico del run.
+          # No se incorpora al repositorio.
           Path("debug").mkdir(exist_ok=True)
-          Path("debug/page.html").write_text(raw, encoding="utf-8")
+          Path("debug/page.html").write_text(
+              raw,
+              encoding="utf-8"
+          )
 
+          # Convertimos la página a texto.
           text = re.sub(
               r"<script\b[^>]*>.*?</script>",
               " ",
@@ -80,85 +100,81 @@ jobs:
 
           text = re.sub(r"<[^>]+>", " ", text)
           text = htmlmod.unescape(text)
-          text = re.sub(r"\s+", " ", text)
+          text = re.sub(r"\s+", " ", text).strip()
 
-          def parse_number(value):
-              value = (
-                  value.lower()
-                  .replace(",", "")
-                  .replace(" ", "")
+          def parse_price(value):
+              return int(value.replace(",", ""))
+
+          results = {}
+
+          for key, player_pattern in TARGETS.items():
+
+              # Estructura observada:
+              #
+              # Rodri 11,750 CDM 90
+              # Kane 14,000 ST 90
+              # Bellingham 121,000 CAM 90
+              #
+              # El precio DEBE estar después del nombre.
+              pattern = re.compile(
+                  rf"\b(?P<name>{player_pattern})\b"
+                  rf"\s+"
+                  rf"(?P<price>\d{{1,3}}(?:,\d{{3}})+)"
+                  rf"\s+"
+                  rf"(?P<position>{POSITIONS})"
+                  rf"\s+"
+                  rf"(?P<rating>\d{{2}})"
+                  rf"\b",
+                  re.I,
               )
 
-              m = re.fullmatch(
-                  r"(\d+(?:\.\d+)?)([km]?)",
-                  value,
-              )
+              matches = list(pattern.finditer(text))
 
-              if not m:
-                  return None
-
-              number = float(m.group(1))
-              unit = m.group(2)
-
-              if unit == "k":
-                  number *= 1000
-              elif unit == "m":
-                  number *= 1000000
-
-              return int(number)
-
-          prices = {}
-          diagnostics = {}
-
-          for player in TARGETS:
-              match = re.search(
-                  re.escape(player),
-                  text,
-                  re.IGNORECASE,
-              )
-
-              if not match:
-                  diagnostics[player] = "NAME NOT FOUND"
+              if not matches:
+                  print(f"NO MATCH: {key}")
                   continue
 
-              window = text[
-                  max(0, match.start() - 80):
-                  match.end() + 350
-              ]
+              # Puede haber varias cartas del mismo jugador.
+              # De momento escogemos la primera aparición,
+              # conservando rating/posición para identificarla.
+              match = matches[0]
 
-              diagnostics[player] = window
+              price = parse_price(match.group("price"))
+              rating = int(match.group("rating"))
+              position = match.group("position").upper()
+              matched_name = match.group("name")
 
-              candidates = re.findall(
-                  r"(?<![\w.])"
-                  r"(\d{1,3}(?:,\d{3})+|"
-                  r"\d+(?:\.\d+)?\s*[kKmM])"
-                  r"(?!\w)",
-                  window,
-              )
+              if not (500 <= price <= 20_000_000):
+                  print(
+                      f"PRECIO INVALIDO: {key} -> {price}"
+                  )
+                  continue
 
-              values = []
+              if not (75 <= rating <= 99):
+                  print(
+                      f"RATING INVALIDO: {key} -> {rating}"
+                  )
+                  continue
 
-              for candidate in candidates:
-                  value = parse_number(candidate)
-
-                  if value and 500 <= value <= 20000000:
-                      values.append(value)
-
-              if values:
-                  prices[player] = values[0]
+              results[key] = {
+                  "name": matched_name,
+                  "price": price,
+                  "position": position,
+                  "rating": rating,
+              }
 
           timestamp = datetime.now(
               timezone.utc
           ).isoformat()
 
           print()
-          print("========== RESULTADO ==========")
+          print("========== SNAPSHOT ==========")
 
           print(
               json.dumps(
                   {
                       "timestamp": timestamp,
-                      "prices": prices,
+                      "players": results,
                   },
                   ensure_ascii=False,
                   indent=2,
@@ -166,27 +182,48 @@ jobs:
           )
 
           print()
-          print("========== CONTEXTO ==========")
-
-          for player, context in diagnostics.items():
-              print(
-                  player,
-                  repr(context[:430])
-              )
-
-          print()
           print(
-              f"PRECIOS EXTRAIDOS: "
-              f"{len(prices)}/{len(TARGETS)}"
+              f"REGISTROS VALIDOS: "
+              f"{len(results)}/{len(TARGETS)}"
           )
 
-          if len(prices) < 8:
+          # No guardamos nada si el parser deja de funcionar.
+          if len(results) < 8:
               raise SystemExit(
-                  "SAFETY CHECK FAILED: "
-                  f"solo {len(prices)}/10 precios"
+                  "VALIDATION FAILED: "
+                  f"solo {len(results)}/10 jugadores"
               )
 
+          # Este primer CSV contenía datos del parser defectuoso.
+          # Si detectamos exactamente el formato antiguo,
+          # lo reiniciamos para no contaminar el histórico.
           output = Path("data/prices.csv")
+
+          old_bad_snapshot = False
+
+          if output.exists():
+              try:
+                  existing = output.read_text(
+                      encoding="utf-8"
+                  )
+
+                  if (
+                      "2026-09-17T12:39:33.353384+00:00"
+                      in existing
+                      and "Bellingham,14000" in existing
+                      and "Rodri,180000" in existing
+                  ):
+                      old_bad_snapshot = True
+
+              except Exception:
+                  pass
+
+          if old_bad_snapshot:
+              print(
+                  "Eliminando snapshot inicial defectuoso."
+              )
+              output.unlink()
+
           output.parent.mkdir(exist_ok=True)
 
           new_file = not output.exists()
@@ -203,23 +240,26 @@ jobs:
                   writer.writerow([
                       "timestamp_utc",
                       "player",
+                      "rating",
+                      "position",
                       "price",
                       "source",
                   ])
 
-              for player in TARGETS:
-                  if player in prices:
-                      writer.writerow([
-                          timestamp,
-                          player,
-                          prices[player],
-                          URL,
-                      ])
+              for player, data in results.items():
+                  writer.writerow([
+                      timestamp,
+                      player,
+                      data["rating"],
+                      data["position"],
+                      data["price"],
+                      URL,
+                  ])
 
           print()
           print(
-              f"STORED {len(prices)} prices "
-              f"in {output}"
+              f"Snapshot válido guardado: "
+              f"{len(results)} registros"
           )
           PY
 
@@ -231,7 +271,7 @@ jobs:
           path: debug/page.html
           retention-days: 1
 
-      - name: Commit price history
+      - name: Commit validated price history
         run: |
           git config user.name "fc27-price-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -239,10 +279,10 @@ jobs:
           git add data/prices.csv
 
           if git diff --cached --quiet; then
-            echo "No snapshot to commit"
+            echo "No changes to commit"
           else
             git commit -m \
-              "data: FC27 snapshot $(date -u +'%Y-%m-%dT%H:%MZ')"
+              "data: validated FC27 snapshot $(date -u +'%Y-%m-%dT%H:%MZ')"
 
             git push
           fi
