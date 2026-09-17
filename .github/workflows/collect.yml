@@ -1,4 +1,4 @@
-name: FC27 price collector
+name: FC27 market engine
 
 on:
   workflow_dispatch:
@@ -9,18 +9,22 @@ permissions:
   contents: write
 
 concurrency:
-  group: fc27-price-collector
+  group: fc27-market-engine
   cancel-in-progress: false
 
 jobs:
-  collect:
+  market-engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch and collect FUT.GG prices
+      # ============================================================
+      # 1. COLECTOR
+      # ============================================================
+
+      - name: Collect FUT.GG prices
         run: |
           python - <<'PY'
           import csv
@@ -28,6 +32,7 @@ jobs:
           import json
           import re
           import urllib.request
+
           from datetime import datetime, timezone
           from pathlib import Path
 
@@ -62,28 +67,40 @@ jobs:
               },
           )
 
-          with urllib.request.urlopen(req, timeout=30) as response:
-              raw = response.read().decode("utf-8", "replace")
+          with urllib.request.urlopen(
+              req,
+              timeout=30
+          ) as response:
+
+              raw = response.read().decode(
+                  "utf-8",
+                  "replace"
+              )
+
               status = response.status
 
           print("HTTP:", status)
           print("Bytes:", len(raw))
 
           if status != 200:
-              raise SystemExit(f"HTTP inesperado: {status}")
+              raise SystemExit(
+                  f"HTTP inesperado: {status}"
+              )
 
           if len(raw) < 10000:
-              raise SystemExit("Respuesta HTML sospechosamente pequeña")
+              raise SystemExit(
+                  "HTML sospechosamente pequeño"
+              )
 
-          # HTML solo para diagnóstico del run.
-          # No se incorpora al repositorio.
           Path("debug").mkdir(exist_ok=True)
-          Path("debug/page.html").write_text(
+
+          Path(
+              "debug/page.html"
+          ).write_text(
               raw,
               encoding="utf-8"
           )
 
-          # Convertimos la página a texto.
           text = re.sub(
               r"<script\b[^>]*>.*?</script>",
               " ",
@@ -98,24 +115,24 @@ jobs:
               flags=re.I | re.S,
           )
 
-          text = re.sub(r"<[^>]+>", " ", text)
-          text = htmlmod.unescape(text)
-          text = re.sub(r"\s+", " ", text).strip()
+          text = re.sub(
+              r"<[^>]+>",
+              " ",
+              text
+          )
 
-          def parse_price(value):
-              return int(value.replace(",", ""))
+          text = htmlmod.unescape(text)
+
+          text = re.sub(
+              r"\s+",
+              " ",
+              text
+          ).strip()
 
           results = {}
 
           for key, player_pattern in TARGETS.items():
 
-              # Estructura observada:
-              #
-              # Rodri 11,750 CDM 90
-              # Kane 14,000 ST 90
-              # Bellingham 121,000 CAM 90
-              #
-              # El precio DEBE estar después del nombre.
               pattern = re.compile(
                   rf"\b(?P<name>{player_pattern})\b"
                   rf"\s+"
@@ -128,103 +145,85 @@ jobs:
                   re.I,
               )
 
-              matches = list(pattern.finditer(text))
+              matches = list(
+                  pattern.finditer(text)
+              )
 
               if not matches:
-                  print(f"NO MATCH: {key}")
+                  print(
+                      f"NO MATCH: {key}"
+                  )
                   continue
 
-              # Puede haber varias cartas del mismo jugador.
-              # De momento escogemos la primera aparición,
-              # conservando rating/posición para identificarla.
               match = matches[0]
 
-              price = parse_price(match.group("price"))
-              rating = int(match.group("rating"))
-              position = match.group("position").upper()
-              matched_name = match.group("name")
+              price = int(
+                  match.group(
+                      "price"
+                  ).replace(",", "")
+              )
 
-              if not (500 <= price <= 20_000_000):
-                  print(
-                      f"PRECIO INVALIDO: {key} -> {price}"
-                  )
+              rating = int(
+                  match.group("rating")
+              )
+
+              position = (
+                  match.group(
+                      "position"
+                  ).upper()
+              )
+
+              if not (
+                  500
+                  <= price
+                  <= 20_000_000
+              ):
                   continue
 
-              if not (75 <= rating <= 99):
-                  print(
-                      f"RATING INVALIDO: {key} -> {rating}"
-                  )
+              if not (
+                  75
+                  <= rating
+                  <= 99
+              ):
                   continue
 
               results[key] = {
-                  "name": matched_name,
                   "price": price,
-                  "position": position,
                   "rating": rating,
+                  "position": position,
               }
+
+          print(
+              json.dumps(
+                  results,
+                  indent=2,
+                  ensure_ascii=False,
+              )
+          )
+
+          print(
+              "REGISTROS VALIDOS:",
+              len(results),
+              "/",
+              len(TARGETS),
+          )
+
+          if len(results) < 8:
+              raise SystemExit(
+                  "Parser validation failed"
+              )
 
           timestamp = datetime.now(
               timezone.utc
           ).isoformat()
 
-          print()
-          print("========== SNAPSHOT ==========")
-
-          print(
-              json.dumps(
-                  {
-                      "timestamp": timestamp,
-                      "players": results,
-                  },
-                  ensure_ascii=False,
-                  indent=2,
-              )
+          output = Path(
+              "data/prices.csv"
           )
 
-          print()
-          print(
-              f"REGISTROS VALIDOS: "
-              f"{len(results)}/{len(TARGETS)}"
+          output.parent.mkdir(
+              exist_ok=True
           )
-
-          # No guardamos nada si el parser deja de funcionar.
-          if len(results) < 8:
-              raise SystemExit(
-                  "VALIDATION FAILED: "
-                  f"solo {len(results)}/10 jugadores"
-              )
-
-          # Este primer CSV contenía datos del parser defectuoso.
-          # Si detectamos exactamente el formato antiguo,
-          # lo reiniciamos para no contaminar el histórico.
-          output = Path("data/prices.csv")
-
-          old_bad_snapshot = False
-
-          if output.exists():
-              try:
-                  existing = output.read_text(
-                      encoding="utf-8"
-                  )
-
-                  if (
-                      "2026-09-17T12:39:33.353384+00:00"
-                      in existing
-                      and "Bellingham,14000" in existing
-                      and "Rodri,180000" in existing
-                  ):
-                      old_bad_snapshot = True
-
-              except Exception:
-                  pass
-
-          if old_bad_snapshot:
-              print(
-                  "Eliminando snapshot inicial defectuoso."
-              )
-              output.unlink()
-
-          output.parent.mkdir(exist_ok=True)
 
           new_file = not output.exists()
 
@@ -247,6 +246,7 @@ jobs:
                   ])
 
               for player, data in results.items():
+
                   writer.writerow([
                       timestamp,
                       player,
@@ -256,12 +256,366 @@ jobs:
                       URL,
                   ])
 
-          print()
           print(
-              f"Snapshot válido guardado: "
-              f"{len(results)} registros"
+              "Snapshot guardado:",
+              timestamp
           )
           PY
+
+      # ============================================================
+      # 2. ANALIZADOR DE MERCADO
+      # ============================================================
+
+      - name: Build market analysis
+        run: |
+          python - <<'PY'
+          import csv
+          import math
+
+          from collections import defaultdict
+          from datetime import datetime
+          from pathlib import Path
+
+          PRICE_FILE = Path(
+              "data/prices.csv"
+          )
+
+          REPORT_FILE = Path(
+              "data/market_report.md"
+          )
+
+          EA_TAX = 0.05
+
+          rows = []
+
+          with PRICE_FILE.open(
+              encoding="utf-8"
+          ) as f:
+
+              for row in csv.DictReader(f):
+
+                  row["price"] = int(
+                      row["price"]
+                  )
+
+                  row["rating"] = int(
+                      row["rating"]
+                  )
+
+                  row["timestamp"] = (
+                      datetime.fromisoformat(
+                          row["timestamp_utc"]
+                      )
+                  )
+
+                  rows.append(row)
+
+          if not rows:
+              raise SystemExit(
+                  "No hay precios"
+              )
+
+          by_player = defaultdict(list)
+
+          for row in rows:
+              by_player[
+                  row["player"]
+              ].append(row)
+
+          def pct(old, new):
+
+              if not old:
+                  return None
+
+              return (
+                  new / old - 1
+              ) * 100
+
+          def fmt_pct(value):
+
+              if value is None:
+                  return "—"
+
+              return (
+                  f"{value:+.2f}%"
+              )
+
+          summaries = []
+
+          for player, history in (
+              by_player.items()
+          ):
+
+              history.sort(
+                  key=lambda x:
+                  x["timestamp"]
+              )
+
+              first = history[0]
+              latest = history[-1]
+
+              prices = [
+                  x["price"]
+                  for x in history
+              ]
+
+              change = pct(
+                  first["price"],
+                  latest["price"]
+              )
+
+              break_even = math.ceil(
+                  latest["price"]
+                  /
+                  (1 - EA_TAX)
+              )
+
+              summaries.append({
+                  "player": player,
+                  "rating":
+                      latest["rating"],
+                  "position":
+                      latest["position"],
+                  "price":
+                      latest["price"],
+                  "observations":
+                      len(history),
+                  "change":
+                      change,
+                  "min":
+                      min(prices),
+                  "max":
+                      max(prices),
+                  "break_even":
+                      break_even,
+              })
+
+          summaries.sort(
+              key=lambda x:
+              x["price"]
+          )
+
+          latest_timestamp = max(
+              x["timestamp"]
+              for x in rows
+          )
+
+          lines = [
+              "# FC27 Market Report",
+              "",
+              (
+                  "Último snapshot UTC: "
+                  f"**{latest_timestamp.isoformat()}**"
+              ),
+              "",
+              (
+                  "Observaciones totales: "
+                  f"**{len(rows)}**"
+              ),
+              "",
+              (
+                  "> Break-even calculado "
+                  "incluyendo el 5% "
+                  "de impuesto de EA."
+              ),
+              "",
+              (
+                  "| Jugador | GRL | Pos | "
+                  "Precio | Obs | Cambio | "
+                  "Mín | Máx | Break-even |"
+              ),
+              (
+                  "|---|---:|---|---:|---:|"
+                  "---:|---:|---:|---:|"
+              ),
+          ]
+
+          for item in summaries:
+
+              lines.append(
+                  f"| {item['player']} "
+                  f"| {item['rating']} "
+                  f"| {item['position']} "
+                  f"| {item['price']:,} "
+                  f"| {item['observations']} "
+                  f"| {fmt_pct(item['change'])} "
+                  f"| {item['min']:,} "
+                  f"| {item['max']:,} "
+                  f"| {item['break_even']:,} |"
+              )
+
+          lines += [
+              "",
+              "## Señales preliminares",
+              "",
+          ]
+
+          # Aún no emitimos señales reales
+          # hasta disponer de histórico suficiente.
+
+          enough_history = all(
+              item["observations"] >= 6
+              for item in summaries
+          )
+
+          if not enough_history:
+
+              lines.append(
+                  "⏳ Acumulando histórico. "
+                  "Se requieren al menos "
+                  "6 observaciones por jugador "
+                  "antes de activar señales."
+              )
+
+          else:
+
+              movers = sorted(
+                  summaries,
+                  key=lambda x:
+                  x["change"],
+              )
+
+              lines.append(
+                  "### Mayores caídas"
+              )
+
+              for item in movers[:5]:
+
+                  lines.append(
+                      f"- {item['player']}: "
+                      f"{fmt_pct(item['change'])}"
+                  )
+
+              lines.append("")
+              lines.append(
+                  "### Mayores subidas"
+              )
+
+              for item in reversed(
+                  movers[-5:]
+              ):
+
+                  lines.append(
+                      f"- {item['player']}: "
+                      f"{fmt_pct(item['change'])}"
+                  )
+
+          REPORT_FILE.write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+
+          print(
+              REPORT_FILE.read_text(
+                  encoding="utf-8"
+              )
+          )
+          PY
+
+      # ============================================================
+      # 3. VALIDACIÓN DEL HISTÓRICO
+      # ============================================================
+
+      - name: Validate database
+        run: |
+          python - <<'PY'
+          import csv
+
+          from collections import Counter
+          from pathlib import Path
+
+          path = Path(
+              "data/prices.csv"
+          )
+
+          rows = list(
+              csv.DictReader(
+                  path.open(
+                      encoding="utf-8"
+                  )
+              )
+          )
+
+          if not rows:
+              raise SystemExit(
+                  "CSV vacío"
+              )
+
+          required = {
+              "timestamp_utc",
+              "player",
+              "rating",
+              "position",
+              "price",
+              "source",
+          }
+
+          if set(
+              rows[0].keys()
+          ) != required:
+
+              raise SystemExit(
+                  "Schema incorrecto"
+              )
+
+          for row in rows:
+
+              price = int(
+                  row["price"]
+              )
+
+              rating = int(
+                  row["rating"]
+              )
+
+              if not (
+                  500
+                  <= price
+                  <= 20_000_000
+              ):
+                  raise SystemExit(
+                      "Precio inválido: "
+                      + str(row)
+                  )
+
+              if not (
+                  75
+                  <= rating
+                  <= 99
+              ):
+                  raise SystemExit(
+                      "Rating inválido: "
+                      + str(row)
+                  )
+
+          counts = Counter(
+              row["player"]
+              for row in rows
+          )
+
+          print(
+              "Filas:",
+              len(rows)
+          )
+
+          print(
+              "Jugadores:",
+              len(counts)
+          )
+
+          print(
+              "Observaciones:",
+              dict(counts)
+          )
+
+          print(
+              "DATABASE VALIDATION OK"
+          )
+          PY
+
+      # ============================================================
+      # 4. ARTIFACT DE DIAGNÓSTICO
+      # ============================================================
 
       - name: Save diagnostic HTML
         if: always()
@@ -271,18 +625,38 @@ jobs:
           path: debug/page.html
           retention-days: 1
 
-      - name: Commit validated price history
+      # ============================================================
+      # 5. GUARDAR HISTÓRICO + INFORME
+      # ============================================================
+
+      - name: Commit market data
         run: |
-          git config user.name "fc27-price-bot"
-          git config user.email "actions@users.noreply.github.com"
+          git config \
+            user.name \
+            "fc27-market-bot"
 
-          git add data/prices.csv
+          git config \
+            user.email \
+            "actions@users.noreply.github.com"
 
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
+          git add \
+            data/prices.csv \
+            data/market_report.md
+
+          if git diff \
+            --cached \
+            --quiet
+          then
+
+            echo \
+              "No changes to commit"
+
           else
-            git commit -m \
-              "data: validated FC27 snapshot $(date -u +'%Y-%m-%dT%H:%MZ')"
+
+            git commit \
+              -m \
+              "data: FC27 market update $(date -u +'%Y-%m-%dT%H:%MZ')"
 
             git push
+
           fi
