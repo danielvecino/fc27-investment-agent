@@ -1,4 +1,4 @@
-name: FC27 market engine v3
+name: FC27 market engine v4
 
 on:
   workflow_dispatch:
@@ -19,6 +19,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install versioned Advisor source
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          files = json.loads('{"src/advisor.py": "\\"\\"\\"Conservative, no-trade FC27 market advisor.\\n\\nThis module never places orders.  It turns independent FUT.GG market snapshots\\ninto an explainable watchlist and records evidence for later evaluation.\\n\\"\\"\\"\\nfrom __future__ import annotations\\n\\nimport csv\\nimport hashlib\\nimport math\\nimport statistics\\nfrom collections import defaultdict\\nfrom dataclasses import dataclass\\nfrom datetime import datetime, timedelta, timezone\\nfrom pathlib import Path\\nfrom typing import Iterable\\n\\nEA_TAX = 0.05\\nHORIZONS = {\\"4h\\": 4, \\"24h\\": 24, \\"3d\\": 72, \\"7d\\": 168}\\n\\n\\ndef parse_time(value: str) -> datetime:\\n    return datetime.fromisoformat(value.replace(\\"Z\\", \\"+00:00\\")).astimezone(timezone.utc)\\n\\n\\ndef market_tick(price: float) -> int:\\n    \\"\\"\\"EA transfer-market price step by price band (kept in one auditable place).\\"\\"\\"\\n    if price < 1_000:\\n        return 50\\n    if price < 10_000:\\n        return 100\\n    if price < 50_000:\\n        return 250\\n    if price < 100_000:\\n        return 500\\n    return 1_000\\n\\n\\ndef round_up_tick(price: float) -> int:\\n    step = market_tick(price)\\n    return int(math.ceil(price / step) * step)\\n\\n\\ndef break_even_buy(target_sale: int) -> int:\\n    \\"\\"\\"Maximum buy price that breaks even after EA\'s 5% tax, tick-rounded.\\"\\"\\"\\n    net = target_sale * (1 - EA_TAX)\\n    return int(math.floor(net / market_tick(net)) * market_tick(net))\\n\\n\\ndef market_data_hash(rows: Iterable[dict]) -> str:\\n    \\"\\"\\"Hash parsed market content, rather than volatile HTML or scrape time.\\"\\"\\"\\n    canonical = [\\n        (r[\\"card_id\\"], int(r[\\"rating\\"]), r[\\"position\\"], int(r[\\"price\\"]))\\n        for r in rows\\n    ]\\n    canonical.sort()\\n    return hashlib.sha256(repr(canonical).encode()).hexdigest()\\n\\n\\ndef regime(at: datetime) -> str:\\n    # FC27 calendar. Dates are deliberately explicit and easy to revise next year.\\n    if at < datetime(2026, 9, 18, tzinfo=timezone.utc):\\n        return \\"PRE_EARLY_ACCESS\\"\\n    if at < datetime(2026, 9, 25, tzinfo=timezone.utc):\\n        return \\"EARLY_ACCESS\\"\\n    if at < datetime(2026, 10, 2, tzinfo=timezone.utc):\\n        return \\"LAUNCH_SHOCK\\"\\n    return \\"NORMALIZING\\"\\n\\n\\ndef asof_price(history: list[dict], at: datetime, tolerance_hours: int = 14) -> dict | None:\\n    \\"\\"\\"Latest observation at/before a target; prevents future-data leakage.\\"\\"\\"\\n    eligible = [r for r in history if r[\\"ts\\"] <= at and at - r[\\"ts\\"] <= timedelta(hours=tolerance_hours)]\\n    return max(eligible, key=lambda r: r[\\"ts\\"]) if eligible else None\\n\\n\\ndef future_price(history: list[dict], after: datetime, tolerance_hours: int) -> dict | None:\\n    eligible = [r for r in history if r[\\"ts\\"] >= after and r[\\"ts\\"] - after <= timedelta(hours=tolerance_hours)]\\n    return min(eligible, key=lambda r: r[\\"ts\\"]) if eligible else None\\n\\n\\ndef pct(now: int, then: dict | None) -> float | None:\\n    return round((now / then[\\"price\\"] - 1) * 100, 3) if then and then[\\"price\\"] else None\\n\\n\\ndef segment_for(row: dict, rating_medians: dict[int, float]) -> str:\\n    \\"\\"\\"Only classify what current input supports; promos remain unknown without card type.\\"\\"\\"\\n    med = rating_medians.get(row[\\"rating\\"], row[\\"price\\"])\\n    if 81 <= row[\\"rating\\"] <= 88 and row[\\"price\\"] <= max(20_000, med * 2):\\n        return \\"fodder\\"\\n    if row[\\"price\\"] >= max(50_000, med * 2.5):\\n        return \\"meta\\"\\n    return \\"other\\"\\n\\n\\ndef independent_rows(rows: list[dict]) -> list[dict]:\\n    \\"\\"\\"One observation per parsed market hash, never per scraper run.\\"\\"\\"\\n    by_snapshot = defaultdict(list)\\n    for row in rows:\\n        by_snapshot[row[\\"snapshot_id\\"]].append(row)\\n    seen, kept = set(), []\\n    for snapshot_rows in sorted(by_snapshot.values(), key=lambda rs: rs[0][\\"ts\\"]):\\n        digest = snapshot_rows[0].get(\\"market_data_sha256\\") or market_data_hash(snapshot_rows)\\n        if digest in seen:\\n            continue\\n        seen.add(digest)\\n        kept.extend(snapshot_rows)\\n    return kept\\n\\n\\ndef load_rows(path: Path) -> list[dict]:\\n    with path.open(encoding=\\"utf-8\\", newline=\\"\\") as handle:\\n        rows = list(csv.DictReader(handle))\\n    for row in rows:\\n        row[\\"price\\"] = int(row[\\"price\\"])\\n        row[\\"rating\\"] = int(row[\\"rating\\"])\\n        row[\\"ts\\"] = parse_time(row[\\"timestamp_utc\\"])\\n    return independent_rows(rows)\\n\\n\\ndef write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:\\n    with path.open(\\"w\\", encoding=\\"utf-8\\", newline=\\"\\") as handle:\\n        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction=\\"ignore\\")\\n        writer.writeheader()\\n        writer.writerows(rows)\\n\\n\\ndef build_advisor(data_dir: Path) -> list[dict]:\\n    rows = load_rows(data_dir / \\"market_prices.csv\\")\\n    if not rows:\\n        raise ValueError(\\"Sin datos de mercado\\")\\n    by_snapshot, by_card = defaultdict(list), defaultdict(list)\\n    for row in rows:\\n        by_snapshot[row[\\"snapshot_id\\"]].append(row)\\n        by_card[row[\\"card_id\\"]].append(row)\\n    for history in by_card.values():\\n        history.sort(key=lambda r: r[\\"ts\\"])\\n    latest = max(by_snapshot.values(), key=lambda rs: rs[0][\\"ts\\"])\\n    now = latest[0][\\"ts\\"]\\n    rating_prices = defaultdict(list)\\n    for row in latest:\\n        rating_prices[row[\\"rating\\"]].append(row[\\"price\\"])\\n    rating_medians = {rating: statistics.median(values) for rating, values in rating_prices.items()}\\n    snapshot_count = len(by_snapshot)\\n    output = []\\n    for current in latest:\\n        history = by_card[current[\\"card_id\\"]]\\n        prices = [r[\\"price\\"] for r in history]\\n        n, span = len(history), (history[-1][\\"ts\\"] - history[0][\\"ts\\"]).total_seconds() / 3600\\n        recent = prices[-min(6, n):]\\n        recent_med = statistics.median(recent)\\n        returns = [math.log(b / a) for a, b in zip(prices, prices[1:]) if a > 0 and b > 0]\\n        volatility = statistics.pstdev(returns) if len(returns) >= 2 else None\\n        persistence = sum(abs(p / recent_med - 1) <= .15 for p in recent) / len(recent) if n >= 3 else 0\\n        coverage = sum(asof_price(history, now - timedelta(hours=h)) is not None for h in HORIZONS.values())\\n        availability = n / snapshot_count\\n        density = len(rating_prices[current[\\"rating\\"]])\\n        liquidity = round(100 * (0.45 * availability + 0.35 * persistence + 0.20 * min(density / 10, 1)))\\n        liquidity = round(liquidity * min(n / 12, span / 48, 1))\\n        confidence = round(100 * (0.40 * min(n / 12, 1) + 0.25 * min(span / 48, 1) + 0.20 * persistence + 0.15 * availability) * (1 - .30 * min((volatility or 0) / .35, 1)))\\n        features = {label: pct(current[\\"price\\"], asof_price(history, now - timedelta(hours=hours))) for label, hours in HORIZONS.items()}\\n        rating_med = rating_medians[current[\\"rating\\"]]\\n        relative_rating = round((current[\\"price\\"] / rating_med - 1) * 100, 3) if rating_med else None\\n        target_sale = round_up_tick(recent_med)\\n        net_roi = round(((target_sale * (1 - EA_TAX)) / current[\\"price\\"] - 1) * 100, 3)\\n        has_temporal_evidence = n >= 12 and span >= 48 and coverage >= 2 and features[\\"24h\\"] is not None\\n        signal, reason = \\"WAIT\\", \\"histórico o cobertura temporal insuficientes\\"\\n        if has_temporal_evidence:\\n            confirmed_discount = len(history) >= 2 and (history[-1][\\"ts\\"] - history[-2][\\"ts\\"]).total_seconds() >= 7200 and all(p <= recent_med * .90 for p in prices[-2:])\\n            if confidence >= 60 and liquidity >= 45 and confirmed_discount and (features[\\"24h\\"] or 0) <= -8 and net_roi >= 8:\\n                signal = \\"WATCH_BUY\\"\\n                reason = \\"descuento 24h persistente, liquidez inferida suficiente y margen neto tras impuesto\\"\\n            else:\\n                reason = \\"sin descuento confirmado o margen neto suficiente\\"\\n        output.append({\\n            \\"timestamp_utc\\": now.isoformat(), \\"snapshot_id\\": current[\\"snapshot_id\\"], \\"market_data_sha256\\": market_data_hash(latest),\\n            \\"card_id\\": current[\\"card_id\\"], \\"name\\": current[\\"name\\"], \\"rating\\": current[\\"rating\\"], \\"position\\": current[\\"position\\"],\\n            \\"segment\\": segment_for(current, rating_medians), \\"price\\": current[\\"price\\"], \\"n_independent\\": n, \\"span_hours\\": round(span, 2),\\n            \\"coverage_windows\\": coverage, \\"return_4h_pct\\": features[\\"4h\\"], \\"return_24h_pct\\": features[\\"24h\\"], \\"return_3d_pct\\": features[\\"3d\\"], \\"return_7d_pct\\": features[\\"7d\\"],\\n            \\"rating_relative_pct\\": relative_rating, \\"persistence\\": round(persistence, 3), \\"volatility\\": round(volatility, 4) if volatility is not None else None,\\n            \\"liquidity_inferred\\": liquidity, \\"confidence\\": confidence, \\"regime\\": regime(now), \\"target_sale\\": target_sale,\\n            \\"break_even_buy\\": break_even_buy(target_sale), \\"net_roi_pct\\": net_roi, \\"signal\\": signal, \\"reason\\": reason,\\n        })\\n    output.sort(key=lambda r: (r[\\"signal\\"] != \\"WATCH_BUY\\", -r[\\"confidence\\"], -r[\\"net_roi_pct\\"]))\\n    fields = list(output[0])\\n    write_csv(data_dir / \\"advisor_watchlist.csv\\", fields, output)\\n    report = [\\"# FC27 Advisor v0.1\\", \\"\\", f\\"Régimen: **{regime(now)}** · observaciones independientes: **{snapshot_count}**.\\", \\"\\", \\"> No compra ni vende automáticamente. Una señal sólo es una carta para revisar manualmente.\\", \\"\\", \\"## Watchlist\\", \\"\\", \\"| Carta | Segmento | Precio | 4h | 24h | 3d | 7d | Cobertura | Liquidez | Conf. | Objetivo | BE compra | Estado |\\", \\"|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\\"]\\n    def format_pct(value): return \\"—\\" if value is None else f\\"{value:+.1f}%\\"\\n    for row in output[:30]:\\n        report.append(f\\"| {row[\'name\']} (`{row[\'card_id\']}`) | {row[\'segment\']} | {row[\'price\']:,} | {format_pct(row[\'return_4h_pct\'])} | {format_pct(row[\'return_24h_pct\'])} | {format_pct(row[\'return_3d_pct\'])} | {format_pct(row[\'return_7d_pct\'])} | {row[\'coverage_windows\']}/4 | {row[\'liquidity_inferred\']} | {row[\'confidence\']} | {row[\'target_sale\']:,} | {row[\'break_even_buy\']:,} | {row[\'signal\']} |\\")\\n    (data_dir / \\"advisor_report.md\\").write_text(\\"\\\\n\\".join(report) + \\"\\\\n\\", encoding=\\"utf-8\\")\\n    return output\\n\\n\\nif __name__ == \\"__main__\\":\\n    import sys\\n    build_advisor(Path(sys.argv[1] if len(sys.argv) > 1 else \\"data\\"))\\n", "src/events.py": "\\"\\"\\"Measure official announcements and rumours separately against later prices.\\"\\"\\"\\nfrom __future__ import annotations\\n\\nimport csv\\nfrom datetime import timedelta\\nfrom pathlib import Path\\n\\nfrom advisor import HORIZONS, future_price, load_rows, parse_time, write_csv\\n\\n\\ndef build_event_reactions(data_dir: Path) -> None:\\n    event_file = data_dir / \\"events.csv\\"\\n    if not event_file.exists():\\n        return\\n    events = list(csv.DictReader(event_file.open(encoding=\\"utf-8\\")))\\n    prices = load_rows(data_dir / \\"market_prices.csv\\")\\n    histories = {}\\n    for row in prices: histories.setdefault(row[\\"card_id\\"], []).append(row)\\n    for history in histories.values(): history.sort(key=lambda r: r[\\"ts\\"])\\n    reactions = []\\n    for event in events:\\n        if not event.get(\\"event_id\\") or event.get(\\"status\\") not in {\\"RUMOUR\\", \\"CONFIRMED\\", \\"RELEASED\\", \\"FALSE\\"}:\\n            continue\\n        at = parse_time(event[\\"detected_at\\"])\\n        target_ids = {x.strip() for x in event.get(\\"affected_players\\", \\"\\").split(\\"|\\") if x.strip().startswith(\\"27-\\")}\\n        for card_id in target_ids:\\n            history = histories.get(card_id, [])\\n            baseline = next((r for r in reversed(history) if r[\\"ts\\"] <= at), None)\\n            if not baseline: continue\\n            row = {\\"event_id\\":event[\\"event_id\\"], \\"event_status\\":event[\\"status\\"], \\"source\\":event.get(\\"source\\", \\"\\"), \\"source_confidence\\":event.get(\\"source_confidence\\", \\"\\"), \\"card_id\\":card_id, \\"detected_at\\":event[\\"detected_at\\"], \\"price_at_detection\\":baseline[\\"price\\"]}\\n            for label, hours in HORIZONS.items():\\n                observed = future_price(history, at + timedelta(hours=hours), max(12, hours // 4))\\n                row[f\\"reaction_{label}_pct\\"] = round((observed[\\"price\\"] / baseline[\\"price\\"] - 1) * 100, 3) if observed else \\"\\"\\n                row[f\\"reaction_{label}_at\\"] = observed[\\"timestamp_utc\\"] if observed else \\"\\"\\n            reactions.append(row)\\n    fields = [\\"event_id\\",\\"event_status\\",\\"source\\",\\"source_confidence\\",\\"card_id\\",\\"detected_at\\",\\"price_at_detection\\",\\"reaction_4h_pct\\",\\"reaction_4h_at\\",\\"reaction_24h_pct\\",\\"reaction_24h_at\\",\\"reaction_3d_pct\\",\\"reaction_3d_at\\",\\"reaction_7d_pct\\",\\"reaction_7d_at\\"]\\n    write_csv(data_dir / \\"event_reactions.csv\\", fields, reactions)\\n\\n\\nif __name__ == \\"__main__\\":\\n    import sys\\n    build_event_reactions(Path(sys.argv[1] if len(sys.argv) > 1 else \\"data\\"))\\n", "src/outcomes.py": "\\"\\"\\"Append-only signal outcomes and event-reaction measurement, without leakage.\\"\\"\\"\\nfrom __future__ import annotations\\n\\nimport csv\\nfrom datetime import timedelta\\nfrom pathlib import Path\\n\\nfrom advisor import HORIZONS, future_price, load_rows, parse_time, write_csv\\n\\n\\ndef build_outcomes(data_dir: Path) -> None:\\n    prices = load_rows(data_dir / \\"market_prices.csv\\")\\n    histories = {}\\n    for row in prices:\\n        histories.setdefault(row[\\"card_id\\"], []).append(row)\\n    for history in histories.values(): history.sort(key=lambda r: r[\\"ts\\"])\\n    watchlist_path = data_dir / \\"advisor_watchlist.csv\\"\\n    signals = list(csv.DictReader(watchlist_path.open(encoding=\\"utf-8\\"))) if watchlist_path.exists() else []\\n    existing_path = data_dir / \\"signal_outcomes.csv\\"\\n    existing = list(csv.DictReader(existing_path.open(encoding=\\"utf-8\\"))) if existing_path.exists() else []\\n    keyed = {(r[\\"timestamp_utc\\"], r[\\"card_id\\"]) for r in existing}\\n    for signal in signals:\\n        if signal[\\"signal\\"] != \\"WATCH_BUY\\" or (signal[\\"timestamp_utc\\"], signal[\\"card_id\\"]) in keyed:\\n            continue\\n        row = {\\"timestamp_utc\\": signal[\\"timestamp_utc\\"], \\"card_id\\": signal[\\"card_id\\"], \\"name\\": signal[\\"name\\"], \\"entry_price\\": signal[\\"price\\"], \\"signal\\": signal[\\"signal\\"], \\"confidence\\": signal[\\"confidence\\"]}\\n        existing.append(row)\\n        keyed.add((signal[\\"timestamp_utc\\"], signal[\\"card_id\\"]))\\n    for row in existing:\\n        baseline = parse_time(row[\\"timestamp_utc\\"])\\n        history = histories.get(row[\\"card_id\\"], [])\\n        for label, hours in {k:v for k,v in HORIZONS.items() if k != \\"4h\\"}.items():\\n            if row.get(f\\"outcome_{label}_at\\"):\\n                continue\\n            observed = future_price(history, baseline + timedelta(hours=hours), max(12, hours // 4))\\n            row[f\\"outcome_{label}_price\\"] = observed[\\"price\\"] if observed else \\"\\"\\n            row[f\\"outcome_{label}_pct\\"] = round((observed[\\"price\\"] * .95 / int(row[\\"entry_price\\"]) - 1) * 100, 3) if observed else \\"\\"\\n            row[f\\"outcome_{label}_at\\"] = observed[\\"timestamp_utc\\"] if observed else \\"\\"\\n    fields = [\\"timestamp_utc\\",\\"card_id\\",\\"name\\",\\"entry_price\\",\\"signal\\",\\"confidence\\",\\"outcome_24h_price\\",\\"outcome_24h_pct\\",\\"outcome_24h_at\\",\\"outcome_3d_price\\",\\"outcome_3d_pct\\",\\"outcome_3d_at\\",\\"outcome_7d_price\\",\\"outcome_7d_pct\\",\\"outcome_7d_at\\"]\\n    write_csv(existing_path, fields, existing)\\n\\n\\nif __name__ == \\"__main__\\":\\n    import sys\\n    build_outcomes(Path(sys.argv[1] if len(sys.argv) > 1 else \\"data\\"))\\n", "tests/test_advisor.py": "import sys\\nimport unittest\\nimport io\\nfrom unittest.mock import patch\\nfrom datetime import datetime, timedelta, timezone\\nfrom pathlib import Path\\n\\nsys.path.insert(0, str(Path(__file__).parents[1] / \\"src\\"))\\nfrom advisor import independent_rows, market_data_hash, round_up_tick\\nfrom advisor import asof_price, break_even_buy\\nfrom outcomes import build_outcomes\\n\\n\\nclass AdvisorTests(unittest.TestCase):\\n    def test_duplicate_market_hash_does_not_become_evidence(self):\\n        start = datetime(2026, 9, 14, tzinfo=timezone.utc)\\n        rows = []\\n        for number in range(13):\\n            price = 1000 + number if number < 12 else 850\\n            sample = {\\"card_id\\":\\"27-x\\", \\"rating\\":84, \\"position\\":\\"ST\\", \\"price\\":price}\\n            digest = market_data_hash([sample])\\n            rows.append({\\"timestamp_utc\\":(start + timedelta(hours=4*number)).isoformat(), \\"ts\\":start + timedelta(hours=4*number), \\"snapshot_id\\":f\\"s{number}\\", \\"market_data_sha256\\":digest, **sample})\\n        duplicate = dict(rows[-1]); duplicate[\\"snapshot_id\\"] = \\"duplicate\\"; rows.append(duplicate)\\n        self.assertEqual(len(independent_rows(rows)), 13)\\n        self.assertEqual(round_up_tick(1001), 1100)\\n\\n    def test_no_future_price_in_features(self):\\n        t = datetime(2026, 9, 14, tzinfo=timezone.utc)\\n        self.assertIsNone(asof_price([{\'ts\': t + timedelta(seconds=1), \'price\': 1000}], t))\\n\\n    def test_tick_at_band_boundary(self):\\n        self.assertEqual(break_even_buy(1000), 950)\\n        self.assertEqual(break_even_buy(10000), 9500)\\n\\n    def test_pending_outcomes_fill_on_later_run(self):\\n        t = datetime(2026, 9, 14, tzinfo=timezone.utc)\\n        captured = []\\n        texts = {\\n            \'advisor_watchlist.csv\': \'timestamp_utc,card_id,signal\\\\n\',\\n            \'signal_outcomes.csv\': \'timestamp_utc,card_id,name,entry_price,signal,confidence\\\\n\' + t.isoformat() + \',27-x,Test,1000,WATCH_BUY,70\\\\n\',\\n        }\\n        rows = [{\'card_id\':\'27-x\', \'ts\':t + timedelta(hours=24), \'timestamp_utc\':(t + timedelta(hours=24)).isoformat(), \'price\':1200}]\\n        with patch(\'outcomes.load_rows\', return_value=rows), patch.object(Path, \'exists\', return_value=True), patch.object(Path, \'open\', lambda p, **kw: io.StringIO(texts[p.name])), patch(\'outcomes.write_csv\', side_effect=lambda p,f,r: captured.extend(r)):\\n            build_outcomes(Path(\'data\'))\\n        self.assertEqual(captured[0][\'outcome_24h_pct\'], 14.0)\\n        self.assertEqual(captured[0][\'outcome_3d_price\'], \'\')\\n\\n\\nif __name__ == \\"__main__\\":\\n    unittest.main()\\n", "data/events.csv": "event_id,detected_at,event_date,event_type,status,source,source_url,source_confidence,affected_ratings,affected_positions,affected_players,expected_direction,notes\\n", "data/historical_sources.md": "# Historical-data policy\\n\\nFC26 and FC25 are not imported as model training data unless the individual\\nprice series can be retrieved and checked for timestamps, platform and enough\\nobservations. FUT.GG exposes prior-season card databases, but sampled FC26\\npages currently report `No price history available`; card metadata and a\\nseason selector are not a price series.\\n\\nWhen a verifiable source is found, store it separately with:\\n\\n- source URL and retrieval timestamp;\\n- game edition, platform and card identifier;\\n- observation timestamp, price and currency;\\n- coverage start/end and missing-data rate.\\n\\nOnly then may it provide a low-weight segment prior. It must never be mixed\\ninto FC27 snapshots or used to label current FC27 signals as known outcomes.\\n", ".gitignore": "__pycache__/\\n*.pyc\\n.test-tmp/\\n", "README.md": "# FC27 Investment Agent\\n\\nAsistente experimental para revisar cartas manualmente. Informe: [Advisor](data/advisor_report.md).\\nEl recolector se ejecuta cada cuatro horas. Conserva los datos originales y exige\\n12 observaciones de mercado distintas y al menos 48 horas antes de WATCH_BUY.\\nLiquidez y segmentos son aproximaciones; cheapest-by-rating es una muestra sesgada,\\nno un registro de ventas ni de profundidad. El objetivo basado en mediana no es una predicción.\\nLos outcomes muestran rentabilidad hipotética después del 5% de EA, no operaciones ejecutadas.\\nLas fechas de régimen son configuración heredada del proyecto. Eventos y rumores requieren\\nregistro con fuente; todavía no hay ingesta automática de noticias ni histórico FC25/26.\\n\\nEl workflow contiene una copia de los módulos para desplegarlos con la sesión web;\\nal modificar el código, hay que actualizar también esa copia o se restaurará en la siguiente ejecución.\\nNo introducir portfolio personal ni tokens en este repositorio público.\\n"}')
+          for name, content in files.items():
+              p = Path(name)
+              p.parent.mkdir(parents=True, exist_ok=True)
+              if name == 'data/events.csv' and p.exists():
+                  continue
+              p.write_text(content, encoding='utf-8')
+          PY
+          python -m unittest discover -s tests -v
 
       - name: Collect dynamic FUT.GG universe
         run: |
@@ -116,161 +131,6 @@ jobs:
           print(json.dumps(list(cards.values())[:10], ensure_ascii=False, indent=2))
           PY
 
-      - name: Analyze market quality and signals
-        run: |
-          python - <<'PY'
-          import csv, math, statistics
-          from collections import defaultdict
-          from datetime import datetime
-          from pathlib import Path
-
-          IN = Path("data/market_prices.csv")
-          REPORT = Path("data/market_report.md")
-          SIGNALS = Path("data/signals.csv")
-          TAX = 0.05
-
-          rows = []
-          with IN.open(encoding="utf-8") as f:
-              for r in csv.DictReader(f):
-                  r["price"] = int(r["price"])
-                  r["rating"] = int(r["rating"])
-                  r["ts"] = datetime.fromisoformat(r["timestamp_utc"])
-                  rows.append(r)
-
-          if not rows:
-              raise SystemExit("Sin datos")
-
-          by_card = defaultdict(list)
-          by_snapshot = defaultdict(list)
-          for r in rows:
-              by_card[r["card_id"]].append(r)
-              by_snapshot[r["snapshot_id"]].append(r)
-          for h in by_card.values():
-              h.sort(key=lambda r: r["ts"])
-
-          latest_snapshot = max(by_snapshot.values(), key=lambda rs: rs[0]["ts"])
-          latest_id = latest_snapshot[0]["snapshot_id"]
-          latest_ts = latest_snapshot[0]["ts"]
-
-          # Índices de mercado por GRL: mediana del precio de las cartas presentes.
-          rating_index = {}
-          for rating in sorted({r["rating"] for r in latest_snapshot}):
-              ps = [r["price"] for r in latest_snapshot if r["rating"] == rating]
-              rating_index[rating] = statistics.median(ps)
-
-          summaries = []
-          emitted = []
-
-          for latest in latest_snapshot:
-              h = by_card[latest["card_id"]]
-              prices = [x["price"] for x in h]
-              n = len(h)
-              med = statistics.median(prices)
-              recent = prices[-6:]
-              recent_med = statistics.median(recent)
-
-              # Cambios logarítmicos son más estables para saltos grandes.
-              log_returns = [
-                  math.log(b / a)
-                  for a, b in zip(prices, prices[1:])
-                  if a > 0 and b > 0
-              ]
-              vol = statistics.pstdev(log_returns) if len(log_returns) >= 2 else None
-
-              # Persistencia: proporción de las últimas observaciones que permanecen
-              # dentro de ±15% de la mediana reciente. En mercados finos no marcamos
-              # saltos como error; reducimos confianza si no persisten.
-              if len(recent) >= 2:
-                  persistence = sum(abs(p / recent_med - 1) <= 0.15 for p in recent) / len(recent)
-              else:
-                  persistence = 0.0
-
-              # Confianza 0..100. Premia histórico y persistencia; penaliza volatilidad,
-              # pero nunca invalida automáticamente un precio por ser extremo.
-              history_score = min(n / 12, 1.0)
-              vol_penalty = min((vol or 0.0) / 0.35, 1.0)
-              confidence = round(100 * (0.55 * history_score + 0.45 * persistence) * (1 - 0.35 * vol_penalty))
-
-              delta_med = (latest["price"] / recent_med - 1) * 100 if recent_med else 0
-              break_even = math.ceil(latest["price"] / (1 - TAX))
-
-              # Señal experimental SOLO con >=12 observaciones (~48h a 4h).
-              # No confunde "caída grande" con error: exige persistencia/confianza
-              # y margen suficiente para cubrir impuesto + colchón.
-              signal = "WAIT"
-              reason = "histórico insuficiente"
-              if n >= 12:
-                  if confidence >= 60 and delta_med <= -10:
-                      target = round(recent_med)
-                      net_roi = ((target * (1 - TAX)) / latest["price"] - 1) * 100
-                      if net_roi >= 8:
-                          signal = "WATCH_BUY"
-                          reason = f"precio {abs(delta_med):.1f}% bajo mediana reciente; ROI neto teórico {net_roi:.1f}%"
-                      else:
-                          reason = "descuento insuficiente tras impuesto"
-                  else:
-                      reason = "sin descuento confirmado o confianza insuficiente"
-
-              summaries.append({
-                  "name": latest["name"], "card_id": latest["card_id"], "rating": latest["rating"],
-                  "pos": latest["position"], "price": latest["price"], "n": n,
-                  "median": round(med), "recent_median": round(recent_med),
-                  "delta": delta_med, "vol": vol, "persistence": persistence,
-                  "confidence": confidence, "break_even": break_even, "signal": signal, "reason": reason,
-              })
-              if signal != "WAIT":
-                  emitted.append((latest, confidence, delta_med, reason))
-
-          # Orden: primero señales, luego menor confianza para que el informe revele
-          # dónde el mercado es más fino/inestable.
-          summaries.sort(key=lambda x: (x["signal"] != "WATCH_BUY", -x["confidence"], x["rating"], x["price"]))
-
-          lines = [
-              "# FC27 Market Report v3", "",
-              f"Snapshot: **{latest_ts.isoformat()}** · ID `{latest_id}`",
-              f"Cartas en snapshot: **{len(latest_snapshot)}** · Cartas históricas: **{len(by_card)}**",
-              "",
-              "> Los movimientos extremos no se descartan: en un mercado con poca oferta pueden ser reales. "
-              "La confianza mide persistencia, historial y volatilidad; no sustituye la liquidez real.",
-              "",
-              "## Índice por GRL", "",
-              "| GRL | Mediana actual |", "|---:|---:|",
-          ]
-          for rating, idx in rating_index.items():
-              lines.append(f"| {rating} | {idx:,.0f} |")
-
-          lines += ["", "## Cartas actuales", "",
-                    "| Carta | ID | GRL | Pos | Precio | Obs | Mediana reciente | Δ mediana | Persist. | Conf. | Break-even | Estado |",
-                    "|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|"]
-          for s in summaries:
-              lines.append(
-                  f"| {s['name']} | `{s['card_id']}` | {s['rating']} | {s['pos']} | {s['price']:,} | "
-                  f"{s['n']} | {s['recent_median']:,} | {s['delta']:+.1f}% | "
-                  f"{s['persistence']:.0%} | {s['confidence']} | {s['break_even']:,} | {s['signal']} |"
-              )
-
-          lines += ["", "## Motor de señales", ""]
-          if not emitted:
-              lines.append("Sin señales activas. El motor exige al menos 12 observaciones por carta y margen neto después del 5% de EA.")
-          else:
-              for r, conf, delta, reason in emitted:
-                  lines.append(f"- **{r['name']} ({r['card_id']})** — confianza {conf}/100: {reason}.")
-
-          REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-          # Registro append-only de señales para backtesting futuro.
-          sig_new = not SIGNALS.exists()
-          with SIGNALS.open("a", newline="", encoding="utf-8") as f:
-              w = csv.writer(f)
-              if sig_new:
-                  w.writerow(["timestamp_utc","snapshot_id","card_id","name","price","signal","confidence","delta_recent_median_pct","reason"])
-              for r, conf, delta, reason in emitted:
-                  w.writerow([r["timestamp_utc"],r["snapshot_id"],r["card_id"],r["name"],r["price"],
-                              "WATCH_BUY",conf,f"{delta:.4f}",reason])
-
-          print(REPORT.read_text(encoding="utf-8"))
-          PY
-
       - name: Validate dataset
         run: |
           python - <<'PY'
@@ -292,6 +152,15 @@ jobs:
           print("Último snapshot:", list(snaps.items())[-1])
           PY
 
+      - name: Build v4 advisor, outcomes and event reactions
+        run: |
+          # Advisor treats matching parsed-market hashes as a single observation,
+          # even when FUT.GG returns the same page on multiple scraper runs.
+          python src/advisor.py data
+          python src/outcomes.py data
+          python src/events.py data
+          python -m unittest discover -s tests -v
+
       - name: Save diagnostic HTML
         if: always()
         uses: actions/upload-artifact@v4
@@ -304,10 +173,10 @@ jobs:
         run: |
           git config user.name "fc27-market-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/market_prices.csv data/snapshots.csv data/market_report.md data/signals.csv
+          git add src/*.py tests/*.py README.md .gitignore data/events.csv data/historical_sources.md data/market_prices.csv data/snapshots.csv data/advisor_watchlist.csv data/advisor_report.md data/signal_outcomes.csv data/event_reactions.csv
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "data: FC27 market v3 $(date -u +'%Y-%m-%dT%H:%MZ')"
+            git commit -m "data: FC27 advisor v4 $(date -u +'%Y-%m-%dT%H:%MZ')"
             git push
           fi
